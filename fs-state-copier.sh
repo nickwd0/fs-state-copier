@@ -3,7 +3,7 @@
 # fs-state-copier.sh - Script to collect metadata of files in a specified source directory,
 # copy the files to a specified destination directory and verify whether the transfer completed successfully.
 #
-# Repository: https://github.com/nickwd0/fs-state-copier
+# Repository: 
 #
 # License: [TBD]
 #
@@ -109,9 +109,6 @@ inventory_run_dir=''
 symlink_mode='preserve'
 hardlink_mode='preserve'
 
-symlink_mode_cli_set='false'
-hardlink_mode_cli_set='false'
-
 # ------------------------------------------------------------ #
 # endregion                                                    #
 # region  2.5. Inventory filters                               #
@@ -180,7 +177,7 @@ sq_signer_userid=''
 
 # GnuPG/gpg
 gpg_local_user=''
-gpg_expected_fingerprint=''
+gpg_verification_fingerprint=''
 
 # ssh-keygen
 ssh_keygen_signing_key_file=''
@@ -197,9 +194,18 @@ minisign_public_key=''
 # region  2.8. Copy object policy                              #
 # ------------------------------------------------------------ #
 
-copy_special_objects='false'
+copy_special_objects_policy='false'
 
-copy_special_objects_cli_set='false'
+# ------------------------------------------------------------ #
+# endregion                                                    #
+# region  2.9. CLI override flags                              #
+# ------------------------------------------------------------ #
+
+declare -A cli_overrides=(
+	[symlink_mode]='false'
+	[hardlink_mode]='false'
+	[special_objects_mode]='false'
+)
 
 # ------------------------------------------------------------ #
 # endregion                                                    #
@@ -214,29 +220,26 @@ copy_special_objects_cli_set='false'
 # region  3.1. Optional-command capabilities                   #
 # ------------------------------------------------------------ #
 
-capability_jq='false'
-capability_getfattr='false'
-capability_eza='false'
-capability_rsync='false'
+declare -A capability=(
+	[jq]='unknown'
+	[getfattr]='unknown'
+	[eza]='unknown'
+	[rsync]='unknown'
+
+	[sq]='unknown'
+	[gpg]='unknown'
+	[ssh-keygen]='unknown'
+	[minisign]='unknown'
+)
 
 # ------------------------------------------------------------ #
 # endregion                                                    #
-# region  3.2. Signing tool capabilities                       #
-# ------------------------------------------------------------ #
-
-capability_sq='false'
-capability_gpg='false'
-capability_ssh_keygen='false'
-capability_minisign='false'
-
-# ------------------------------------------------------------ #
-# endregion                                                    #
-# region  3.3. rsync capability state                          #
+# region  3.2. rsync capability state                          #
 # ------------------------------------------------------------ #
 
 rsync_version_output=''
 rsync_version=''
-declare -A rsync_capability=(
+declare -A rsync_capabilities=(
 	[socketpairs]='unknown'
 	[symlinks]='unknown'
 	[symtimes]='unknown'
@@ -648,7 +651,7 @@ cd_or_die() {
 #   json_string_or_null
 #   load_inventory_metadata
 #   record_artifact_event
-#   inventory_write_json_string_array
+#   json_string_array
 #   inventory_write_config
 #
 # Bash built-ins used:
@@ -690,8 +693,12 @@ json_bool() {
 	local bool="${1}"
 
 	case "${bool}" in
-		('true' | 'false') printf '%s' "${1}" ;;
-		(*) printf 'false' ;;
+		('true' | 'false')
+			printf '%s' "${1}"
+			;;
+		(*)
+			printf 'false'
+			;;
 	esac
 }
 
@@ -744,6 +751,21 @@ json_number_or_null() {
 	else
 		printf 'null'
 	fi
+}
+
+json_string_array() {
+	local -n values="${1}"
+	local value
+	local first='true'
+
+	for value in "${values[@]}"; do
+		if [[ "${first}" == 'true' ]]; then
+			first='false'
+		else
+			printf ', '
+		fi
+		printf '"%s"' "$(json_escape "${value}")"
+	done
 }
 
 # ------------------------------------------------------------ #
@@ -803,7 +825,7 @@ count_nul_records() {
 #   log_err
 #   start_phase_at
 #   finish_phase
-#   create_bootstrap_log
+#   create_bootstrap_logs
 #   create_bootstrap_timings_log
 #   initialise_bash_logger
 #   finalise_log_location
@@ -823,14 +845,14 @@ log_bootstrap_message() {
 	fi
 
 	if [[ -z "${bootstrap_log}" ]]; then
-		printf '%s [%s] [CRITICAL] Bootstrap logging failed\n' "$(get_current_timestamp)" "${FSC_SCRIPT_NAME}" >&2
+		printf '%s [%s] [CRITICAL] Bootstrap logging failed\n' "$(get_current_timestamp)" "${FSC_SCRIPT_NAME_EXT}" >&2
 		exit "${EX_ENV}"
 	fi
 
 	local level="${1}"
 	local message="${2}"
 
-	printf '%s [%s] [%s] %s\n' "$(get_current_timestamp)" "${FSC_SCRIPT_NAME}" "${level}" "${message}" | tee -a -- "${bootstrap_log}"
+	printf '%s [%s] [%s] %s\n' "$(get_current_timestamp)" "${FSC_SCRIPT_NAME_EXT}" "${level}" "${message}" | tee -a -- "${bootstrap_log}"
 }
 
 # ------------------------------------------------------------ #
@@ -899,7 +921,7 @@ log_err() {
 # region  9.3. Fatal termination                               #
 # ------------------------------------------------------------ #
 
-# Usage: fatal_exit <exit_code> <error_message...>
+# Usage: fatal_exit <exit_code> [error_message...]
 fatal_exit() {
 	local exit_code="${1}"
 	shift
@@ -933,7 +955,8 @@ ask_for_user_confirmation() {
 			('No' | 'no' | 'n')
 				return 1
 				;;
-			(*) ;;
+			(*)
+				;;
 		esac
 	done
 }
@@ -985,7 +1008,7 @@ finish_phase() {
 
 	if [[ "${bash_logger_ready}" == 'true' ]]; then
 		log_debug "Phase ${active_phase} completed in $((elapsed_ns / 1000000000)) seconds"
-	else
+	elif [[ "${DEBUG}" == 'true' ]]; then
 		log_bootstrap_message 'DEBUG' "Phase ${active_phase} completed in $((elapsed_ns / 1000000000)) seconds"
 	fi
 
@@ -1010,20 +1033,29 @@ transition_phase() {
 # region 11.1. Bootstrap logging                               #
 # ------------------------------------------------------------ #
 
-create_bootstrap_log() {
+create_bootstrap_logs() {
 	local created_log
+	local type
+	local type_space
 
-	if ! created_log="$(mktemp -t "${FSC_SCRIPT_NAME}_bootstrap_log_XXXXXXXX")"; then
-		printf '%s\n' 'Could not create bootstrap log' >&2
-		exit "${EX_ENV}"
-	fi
+	for type in 'log' 'timings_log'; do
+		type_space="${type/_/ }"
+		if ! created_log="$(mktemp -t "${FSC_SCRIPT_NAME}_bootstrap_${type}_XXXXXXXX")"; then
+			printf '%s\n' "Could not create bootstrap ${type_space}" >&2
+			exit "${EX_ENV}"
+		fi
 
-	bootstrap_log="${created_log}"
+		if [[ "${type}" == 'log' ]]; then
+			bootstrap_log="${created_log}"
+		else
+			bootstrap_timings_log="${created_log}"
+		fi
 
-	if [[ "${DEBUG}" == 'true' ]]; then
-		log_bootstrap_message 'DEBUG' 'Initialised bootstrap logging'
-		log_bootstrap_message 'DEBUG' "Bootstrap log location: ${bootstrap_log}"
-	fi
+		if [[ "${DEBUG}" == 'true' ]]; then
+			log_bootstrap_message 'DEBUG' "Initialised bootstrap ${type_space}ging"
+			log_bootstrap_message 'DEBUG' "Bootstrap ${type_space} location: ${created_log}"
+		fi
+	done
 }
 
 # ------------------------------------------------------------ #
@@ -1058,9 +1090,9 @@ initialise_bash_logger() {
 	fi
 
 	# Verify checksum of bash-logger before sourcing"${PREFIX}/lib/bash-logger/logging.sh"
-	local expected_checksum="41ce13d95cabe790728f23eb1ceeb8911fc415416178ab72fe9a6d0571a5c8da"
+	local expected_checksum="671444EBDC1E16E9BC7B3078AD7DAE795842F0D60FCB81950C818F842CD4F91C"
 	local actual_checksum
-	actual_checksum="$(sha256sum "${BASH_LOGGER_FILE}" | awk '{print $1}')"
+	actual_checksum="$(sha256sum "${BASH_LOGGER_FILE}" | awk '{print $1}' | tr a-z A-Z | tr -dc A-Z0-9)"
 
 	if [[ "${actual_checksum}" != "${expected_checksum}" ]]; then
 		log_bootstrap_message 'CRITICAL' 'logging.sh checksum mismatch!' >&2
@@ -1093,7 +1125,7 @@ finalise_log_location() {
 	final_log="${run_dir}/logs/${FSC_SCRIPT_NAME}.log"
 	mkdir --parents -- "${run_dir}/logs"
 
-	cat "${bootstrap_log}" >> "${final_log}"
+	cp -- "${bootstrap_log}" "${final_log}"
 	if ! cmp --silent -- "${bootstrap_log}" "${final_log}"; then
 		fatal_exit "${EX_ENV}" 'Bootstrap log was not successfully copied to final log location'
 	fi
@@ -1118,13 +1150,18 @@ finalise_log_location() {
 
 finalise_timings_log_location() {
 	final_timings_log="${run_dir}/logs/${FSC_SCRIPT_NAME}.timings.tsv"
-	cat "${bootstrap_timings_log}" > "${final_timings_log}"
+	mkdir --parents -- "${run_dir}/logs"
+
+	cp -- "${bootstrap_timings_log}" "${final_timings_log}"
 	if ! cmp --silent -- "${bootstrap_timings_log}" "${final_timings_log}"; then
 		fatal_exit "${EX_ENV}" 'Bootstrap timings log was not successfully copied to final timings log location'
 	fi
+
 	log_debug "Bootstrap timings log successfully copied to final timings log location (from ${bootstrap_timings_log} to ${final_timings_log})"
+
 	log_notice 'Removing bootstrap timings log'
 	rm -f "${bootstrap_timings_log}"
+	unset bootstrap_timings_log
 }
 
 # ------------------------------------------------------------ #
@@ -1215,15 +1252,15 @@ require_gnu_getopt() {
 # ------------------------------------------------------------ #
 
 detect_optional_capabilities() {
-	if command -v jq > /dev/null 2>&1; then capability_jq='true'; fi
-	if command -v eza > /dev/null 2>&1; then capability_eza='true'; fi
-	if command -v getfattr > /dev/null 2>&1; then capability_getfattr='true'; fi
-	if command -v rsync > /dev/null 2>&1; then capability_rsync='true'; fi
+	local binary
 
-	if command -v sq > /dev/null 2>&1; then capability_sq='true'; fi
-	if command -v gpg > /dev/null 2>&1; then capability_gpg='true'; fi
-	if command -v ssh-keygen > /dev/null 2>&1; then capability_ssh_keygen='true'; fi
-	if command -v minisign > /dev/null 2>&1; then capability_minisign='true'; fi
+	for binary in "${!capability[@]}"; do
+		if command -v "${binary}" > /dev/null 2>&1; then
+			capability["${binary}"]='true'
+		else
+			capability["${binary}"]='false'
+		fi
+	done
 }
 
 # ------------------------------------------------------------ #
@@ -1234,7 +1271,7 @@ detect_optional_capabilities() {
 detect_rsync_information() {
 	local rc
 
-	if [[ "${capability_rsync}" != 'true' ]]; then
+	if [[ "${capability[rsync]}" != 'true' ]]; then
 		return 0
 	fi
 
@@ -1245,20 +1282,20 @@ detect_rsync_information() {
 	else
 		rc="${?}"
 		log_warning "rsync is installed but could not execute (error ${rc}); falling back to the non-rsync copy backend"
-		capability_rsync='false'
+		capability[rsync]='false'
 		rsync_version_output=''
 		return 0
 	fi
 
 	if [[ -z "${rsync_version_output}" ]]; then
 		log_warning 'rsync returned empty version output; falling back to the non-rsync copy backend'
-		capability_rsync='false'
+		capability[rsync]='false'
 		return 0
 	fi
 
 	if [[ "${rsync_version_output}" != *'version '* ]]; then
 		log_warning 'Could not parse rsync version; disabling rsync backend'
-		capability_rsync='false'
+		capability[rsync]='false'
 		return 0
 	fi
 
@@ -1274,7 +1311,7 @@ parse_rsync_capabilities() {
 	local state
 	local -a capabilities
 
-	if [[ "${capability_rsync}" != 'true' ]]; then
+	if [[ "${capability[rsync]}" != 'true' ]]; then
 		return 0
 	fi
 
@@ -1306,8 +1343,8 @@ parse_rsync_capabilities() {
 		cap="${cap#optional }"
 		key="${cap//-/_}"
 
-		if [[ -v "rsync_capability[${key}]" ]]; then
-			rsync_capability["${key}"]="${state}"
+		if [[ -v "rsync_capabilities[${key}]" ]]; then
+			rsync_capabilities["${key}"]="${state}"
 		fi
 	done
 }
@@ -1343,9 +1380,11 @@ Required options:
 Mode-specific options:
   -d, --destination DIR
       Required for copy, verify, and all.
+	  Required for inventory, if --output-dir not present
 
   --output-dir DIR
       Directory in which run artifacts are stored.
+	  Required for inventory, if --destination not present
 
   --inventory-run-dir DIR
       Existing inventory run used by verify mode.
@@ -1677,7 +1716,7 @@ parse_command_line() {
 				case "${2}" in
 					('preserve' | 'dereference' | 'reject')
 						symlink_mode="${2}"
-						symlink_mode_cli_set='true'
+						cli_overrides['symlink_mode']='true'
 						;;
 					(*)
 						fatal_exit "${EX_USAGE}" \
@@ -1692,7 +1731,7 @@ parse_command_line() {
 				case "${2}" in
 					('preserve' | 'duplicate' | 'reject')
 						hardlink_mode="${2}"
-						hardlink_mode_cli_set='true'
+						cli_overrides['hardlink_mode']='true'
 						;;
 					(*)
 						fatal_exit "${EX_USAGE}" \
@@ -1703,8 +1742,8 @@ parse_command_line() {
 				shift 2
 				;;
 			('--copy-special-objects')
-				copy_special_objects='true'
-				copy_special_objects_cli_set='true'
+				copy_special_objects_policy='true'
+				cli_overrides['special_objects_mode']='true'
 				log_debug 'Copying special objects enabled'
 				shift
 				;;
@@ -1791,7 +1830,7 @@ parse_command_line() {
 				log_debug "Processing argument ${1}"
 
 				if [[ -n "${2:-}" ]]; then
-					gpg_expected_fingerprint="${2}"
+					gpg_verification_fingerprint="${2}"
 					log_debug "${1} set to ${2}"
 				else
 					log_debug "No value was provided for ${1}"
@@ -1909,19 +1948,19 @@ parse_command_line() {
 # ------------------------------------------------------------ #
 
 detect_default_signer() {
-	if [[ "${capability_sq}" == 'true' ]]; then
+	if [[ "${capability[sq]}" == 'true' ]]; then
 		printf '%s\n' 'sq'
 		return 0
 	fi
-	if [[ "${capability_gpg}" == 'true' ]]; then
+	if [[ "${capability[gpg]}" == 'true' ]]; then
 		printf '%s\n' 'gpg'
 		return 0
 	fi
-	if [[ "${capability_ssh_keygen}" == 'true' ]]; then
+	if [[ "${capability[ssh-keygen]}" == 'true' ]]; then
 		printf '%s\n' 'ssh-keygen'
 		return 0
 	fi
-	if [[ "${capability_minisign}" == 'true' ]]; then
+	if [[ "${capability[minisign]}" == 'true' ]]; then
 		printf '%s\n' 'minisign'
 		return 0
 	fi
@@ -1944,7 +1983,7 @@ validate_signing_configuration() {
 
 	case "${signer_command}" in
 		('sq')
-			if [[ "${capability_sq}" != 'true' ]]; then
+			if [[ "${capability[sq]}" != 'true' ]]; then
 				fatal_exit "${EX_SIGN_UNAVAILABLE}" "Signer ${signer_command} requested but ${signer_command} is not installed"
 			fi
 
@@ -1958,7 +1997,7 @@ validate_signing_configuration() {
 			fi
 			;;
 		('gpg')
-			if [[ "${capability_gpg}" != 'true' ]]; then
+			if [[ "${capability[gpg]}" != 'true' ]]; then
 				fatal_exit "${EX_SIGN_UNAVAILABLE}" "Signer ${signer_command} requested but ${signer_command} is not installed"
 			fi
 
@@ -1972,7 +2011,7 @@ validate_signing_configuration() {
 			fi
 			;;
 		('ssh-keygen')
-			if [[ "${capability_ssh_keygen}" != 'true' ]]; then
+			if [[ "${capability[ssh-keygen]}" != 'true' ]]; then
 				fatal_exit "${EX_SIGN_UNAVAILABLE}" "Signer ${signer_command} requested but ${signer_command} is not installed"
 			fi
 
@@ -1985,7 +2024,7 @@ validate_signing_configuration() {
 			fi
 			;;
 		('minisign')
-			if [[ "${capability_minisign}" != 'true' ]]; then
+			if [[ "${capability[minisign]}" != 'true' ]]; then
 				fatal_exit "${EX_SIGN_UNAVAILABLE}" "Signer ${signer_command} requested but ${signer_command} is not installed"
 			fi
 
@@ -2010,7 +2049,7 @@ validate_signature_verification_selection() {
 
 	case "${signer_command}" in
 		('sq')
-			if [[ "${capability_sq}" != 'true' ]]; then
+			if [[ "${capability[sq]}" != 'true' ]]; then
 				fatal_exit "${EX_SIGN_UNAVAILABLE}" "Signer ${signer_command} requested but ${signer_command} is not installed"
 			fi
 
@@ -2019,16 +2058,16 @@ validate_signature_verification_selection() {
 			fi
 			;;
 		('gpg')
-			if [[ "${capability_gpg}" != 'true' ]]; then
+			if [[ "${capability[gpg]}" != 'true' ]]; then
 				fatal_exit "${EX_SIGN_UNAVAILABLE}" "Signer ${signer_command} requested but ${signer_command} is not installed"
 			fi
 
-			if [[ -z "${gpg_expected_fingerprint}" ]]; then
+			if [[ -z "${gpg_verification_fingerprint}" ]]; then
 				log_notice 'No fingerprint was specified for gpg; will only check whether signatures are valid'
 			fi
 			;;
 		('ssh-keygen')
-			if [[ "${capability_ssh_keygen}" != 'true' ]]; then
+			if [[ "${capability[ssh-keygen]}" != 'true' ]]; then
 				fatal_exit "${EX_SIGN_UNAVAILABLE}" "Signer ${signer_command} requested but ${signer_command} is not installed"
 			fi
 
@@ -2040,7 +2079,7 @@ validate_signature_verification_selection() {
 			fi
 			;;
 		('minisign')
-			if [[ "${capability_minisign}" != 'true' ]]; then
+			if [[ "${capability[minisign]}" != 'true' ]]; then
 				fatal_exit "${EX_SIGN_UNAVAILABLE}" "Signer ${signer_command} requested but ${signer_command} is not installed"
 			fi
 
@@ -2157,11 +2196,11 @@ apply_inventory_link_policy() {
 			"Invalid inventory hard-link policy: ${configured_hardlink_mode}"
 	fi
 
-	if [[ "${symlink_mode_cli_set}" != 'true' ]]; then
+	if [[ "${cli_overrides['symlink_mode']}" != 'true' ]]; then
 		symlink_mode="${configured_symlink_mode}"
 	fi
 
-	if [[ "${hardlink_mode_cli_set}" != 'true' ]]; then
+	if [[ "${cli_overrides['hardlink_mode']}" != 'true' ]]; then
 		hardlink_mode="${configured_hardlink_mode}"
 	fi
 }
@@ -2193,7 +2232,7 @@ load_inventory_metadata() {
 			"Invalid inventory source identity: ${source_identity_file}"
 	fi
 
-	if [[ "${capability_jq}" == 'true' ]]; then
+	if [[ "${capability[jq]}" == 'true' ]]; then
 		if ! jq -e \
 			--arg source "${source_dir}" \
 			'
@@ -2209,7 +2248,7 @@ load_inventory_metadata() {
 			 .hardlink_mode == "duplicate" or
 			 .hardlink_mode == "reject") and
 			(.allow_empty | type == "boolean") and
-			(.copy_special_objects | type == "boolean") and
+			(.copy_special_objects_policy | type == "boolean") and
 			(.inventory_find_args | type == "array" and
 			 all(.[]; type == "string")) and
 			(.hash_algorithms | type == "array" and
@@ -2224,7 +2263,7 @@ load_inventory_metadata() {
 				"Missing source_dir in inventory configuration: ${metadata_file}"
 		fi
 
-		if [[ "${config_source}" != "${recorded_source}" ||
+		if [[ "${config_source}" != "${recorded_source}" &&
 			"${config_source}" != "${source_dir}" ]]; then
 			fatal_exit "${EX_CONFIG}" \
 				'Requested source does not match the inventory source'
@@ -2246,9 +2285,9 @@ load_inventory_metadata() {
 			fatal_exit "${EX_VERIFY_INPUT_MISSING}" \
 				"Could not read allow_empty: ${metadata_file}"
 		fi
-		if ! config_special_objects="$(jq -r '.copy_special_objects' "${metadata_file}")"; then
+		if ! config_special_objects="$(jq -r '.copy_special_objects_policy' "${metadata_file}")"; then
 			fatal_exit "${EX_VERIFY_INPUT_MISSING}" \
-				"Could not read copy_special_objects: ${metadata_file}"
+				"Could not read copy_special_objects_policy: ${metadata_file}"
 		fi
 
 		inventory_recorded_find_args=()
@@ -2267,7 +2306,7 @@ load_inventory_metadata() {
 			! grep -Fq '"symlink_mode": "' "${metadata_file}" ||
 			! grep -Fq '"hardlink_mode": "' "${metadata_file}" ||
 			! grep -Fq '"allow_empty": ' "${metadata_file}" ||
-			! grep -Fq '"copy_special_objects": ' "${metadata_file}" ||
+			! grep -Fq '"copy_special_objects_policy": ' "${metadata_file}" ||
 			! grep -Fq '"inventory_find_args": [' "${metadata_file}" ||
 			! grep -Fq '"hash_algorithms": ["sha256", "sha512"]' "${metadata_file}"; then
 			fatal_exit "${EX_VERIFY_INPUT_MISSING}" \
@@ -2312,13 +2351,13 @@ load_inventory_metadata() {
 				"Invalid allow_empty value: ${metadata_file}"
 		fi
 
-		if grep -Fq '"copy_special_objects": true' "${metadata_file}"; then
+		if grep -Fq '"copy_special_objects_policy": true' "${metadata_file}"; then
 			config_special_objects='true'
-		elif grep -Fq '"copy_special_objects": false' "${metadata_file}"; then
+		elif grep -Fq '"copy_special_objects_policy": false' "${metadata_file}"; then
 			config_special_objects='false'
 		else
 			fatal_exit "${EX_VERIFY_INPUT_MISSING}" \
-				"Invalid copy_special_objects value: ${metadata_file}"
+				"Invalid copy_special_objects_policy value: ${metadata_file}"
 		fi
 
 		inventory_recorded_find_args=("${inventory_find_args[@]}")
@@ -2337,16 +2376,17 @@ load_inventory_metadata() {
 	inventory_copy_special_objects="${config_special_objects}"
 
 	if [[ "${mode}" == 'verify' ]]; then
-		if [[ "${symlink_mode_cli_set}" == 'true' ||
-			"${hardlink_mode_cli_set}" == 'true' ]]; then
+		if [[ "${cli_overrides['symlink_mode']}" == 'true' ||
+			"${cli_overrides['hardlink_mode']}" == 'true' ]]; then
 			fatal_exit "${EX_CONFIG}" \
 				'Link-policy overrides are not allowed in verify mode'
 		fi
 
 		symlink_mode="${inventory_symlink_mode}"
 		hardlink_mode="${inventory_hardlink_mode}"
+		allow_empty="${config_allow_empty}"
 
-		if [[ "${copy_special_objects_cli_set}" == 'true' ]]; then
+		if [[ "${cli_overrides['special_objects_mode']}" == 'true' ]]; then
 			fatal_exit "${EX_CONFIG}" \
 				'Copy special objects policy override is not allowed in verify mode'
 		fi
@@ -2355,8 +2395,8 @@ load_inventory_metadata() {
 			"${inventory_symlink_mode}" \
 			"${inventory_hardlink_mode}"
 
-		if [[ "${copy_special_objects_cli_set}" != "true" ]]; then
-			copy_special_objects="${inventory_copy_special_objects}"
+		if [[ "${cli_overrides['special_objects_mode']}" != "true" ]]; then
+			copy_special_objects_policy="${inventory_copy_special_objects}"
 		fi
 	fi
 }
@@ -2770,7 +2810,8 @@ record_artifact_event() {
 		"\"previous_state\":\"$(json_escape "${previous_state}")\"" \
 		"\"result\":\"$(json_escape "${result}")\"" \
 		"\"detail\":\"$(json_escape "${detail}")\"" \
-		>> "${artifact_registry_path}"; then
+		>> "${artifact_registry_path}"
+	then
 		artifact_last_events["${absolute_path}"]="${event}"
 		artifact_last_states["${absolute_path}"]="$(get_filesystem_object_type "${absolute_path}")"
 		return 0
@@ -3056,6 +3097,8 @@ write_artifact_atomically() {
 	local error_message=''
 	local primary_error=''
 	local registry_error=''
+	local output_parent
+	output_parent="$(dirname -- "${output_file}")"
 
 	if [[ -z "${writer}" ]]; then
 		artifact_last_error='Artifact writer command must not be empty'
@@ -3086,6 +3129,13 @@ write_artifact_atomically() {
 		else
 			error_code="${?}"
 			error_message="Failed to plan artifact: ${artifact_last_error}"
+		fi
+	fi
+
+	if [[ -z "${error_message}" ]]; then
+		if ! mkdir --parents -- "${output_parent}"; then
+			artifact_last_error="Could not create artifact directory: ${output_parent}"
+			return "${EX_ENV}"
 		fi
 	fi
 
@@ -3192,7 +3242,11 @@ inventory_write_file_list_nul() {
 }
 
 inventory_write_file_list_text() {
-	tr '\0' '\n' < "${run_dir}/source.files.null" | sed -e 's/\\/\\\\/g' -e 's/\t/\\t/g'
+	local path
+
+	while IFS= read -r -d '' path; do
+		printf '%s\n' "$(json_escape "${path}")"
+	done < "${run_dir}/source.files.null"
 }
 
 inventory_write_directory_list_nul() {
@@ -3200,7 +3254,11 @@ inventory_write_directory_list_nul() {
 }
 
 inventory_write_directory_list_text() {
-	tr '\0' '\n' < "${run_dir}/source.directories.null" | sed -e 's/\\/\\\\/g' -e 's/\t/\\t/g'
+	local path
+
+	while IFS= read -r -d '' path; do
+		printf '%s\n' "$(json_escape "${path}")"
+	done < "${run_dir}/source.directories.null"
 }
 
 inventory_write_symlink_list_nul() {
@@ -3208,7 +3266,11 @@ inventory_write_symlink_list_nul() {
 }
 
 inventory_write_symlink_list_text() {
-	tr '\0' '\n' < "${run_dir}/source.symlinks.null" | sed -e 's/\\/\\\\/g' -e 's/\t/\\t/g'
+	local path
+
+	while IFS= read -r -d '' path; do
+		printf '%s\n' "$(json_escape "${path}")"
+	done < "${run_dir}/source.symlinks.null"
 }
 
 inventory_write_object_list_nul() {
@@ -3219,13 +3281,17 @@ inventory_write_object_list_nul_for_root() {
 	local root="${1}"
 
 	(
-		cd -- "${root}" || return "${EX_ENV}"
+		if ! cd -- "${root}"; then return "${EX_ENV}"; fi
 		find . -mindepth 1 -print0 | sort -z
 	)
 }
 
 inventory_write_object_list_text() {
-	tr '\0' '\n' < "${run_dir}/source.all.null" | sed -e 's/\\/\\\\/g' -e 's/\t/\\t/g'
+	local path
+
+	while IFS= read -r -d '' path; do
+		printf '%s\n' "$(json_escape "${path}")"
+	done < "${run_dir}/source.all.null"
 }
 
 inventory_write_object_lists() {
@@ -3667,11 +3733,11 @@ build_object_manifest_record() {
 }
 
 # Usage:
-#   write_source_object_manifest <source_root> <null_path_list>
+#   build_object_manifest <source_root> <null_path_list>
 #
 # Writes the canonical metadata manifest to stdout.
 # Does not create files.
-write_source_object_manifest() {
+build_object_manifest() {
 	if [[ "${#}" -ne '2' ]]; then
 		artifact_last_error="Invalid arguments for ${FUNCNAME[0]}"
 		return "${EX_USAGE}"
@@ -3750,7 +3816,7 @@ inventory_write_source_object_manifest() {
 		'Failed to generate canonical source metadata manifest' \
 		'run' \
 		"${output_path}" \
-		'write_source_object_manifest' \
+		'build_object_manifest' \
 		"${source_dir}" \
 		"${null_path_list}"
 
@@ -3780,33 +3846,19 @@ inventory_write_source_identity() {
 	printf '%s\0' "${source_dir}"
 }
 
-inventory_write_json_string_array() {
-	local -n values="${1}"
-	local value
-	local first='true'
-
-	for value in "${values[@]}"; do
-		if [[ "${first}" == 'true' ]]; then
-			first='false'
-		else
-			printf ', '
-		fi
-		printf '"%s"' "$(json_escape "${value}")"
-	done
-}
-
 inventory_write_config() {
+	# shellcheck disable=SC2312
 	cat <<EOF
 {
   "schema_version": ${inventory_config_schema_version},
-  "source_dir": "$(json_escape "${source_dir}")",
-  "symlink_mode": "$(json_escape "${symlink_mode}")",
-  "hardlink_mode": "$(json_escape "${hardlink_mode}")",
+  "source_dir": $(json_string_or_null "${source_dir}"),
+  "symlink_mode": $(json_string_or_null "${symlink_mode}"),
+  "hardlink_mode": $(json_string_or_null "${hardlink_mode}"),
   "allow_empty": $(json_bool "${allow_empty}"),
-  "copy_special_objects": $(json_bool "${copy_special_objects}"),
-  "inventory_find_args": [$(inventory_write_json_string_array inventory_find_args)],
+  "copy_special_objects_policy": $(json_bool "${copy_special_objects_policy}"),
+  "inventory_find_args": [$(json_string_array inventory_find_args)],
   "hash_algorithms": ["sha256", "sha512"],
-  "created_at": "$(json_escape "$(get_current_timestamp)")"
+  "created_at": $(json_string_or_null "$(get_current_timestamp)")
 }
 EOF
 }
@@ -4091,7 +4143,7 @@ inventory_write_eza_metadata() {
 }
 
 inventory_collect_eza_metadata() {
-	if [[ "${capability_eza}" == 'false' ]]; then
+	if [[ "${capability[eza]}" == 'false' ]]; then
 		log_warning 'eza not found; skipping eza output'
 		return 0
 	fi
@@ -4136,7 +4188,7 @@ inventory_write_extended_attributes() {
 }
 
 inventory_collect_extended_attributes() {
-	if [[ "${capability_getfattr}" == 'false' ]]; then
+	if [[ "${capability[getfattr]}" == 'false' ]]; then
 		log_warning 'getfattr not found; skipping extended attributes collection'
 		return 0
 	fi
@@ -4243,9 +4295,15 @@ hash_file() {
 	local file="${2}"
 
 	case "${alg}" in
-		(sha256) sha256sum --zero -- "${file}" ;;
-		(sha512) sha512sum --zero -- "${file}" ;;
-		(*) fatal_exit "${EX_INV_HASH}" "Unsupported hash algorithm: ${alg}" ;;
+		(sha256)
+			sha256sum --zero -- "${file}"
+			;;
+		(sha512)
+			sha512sum --zero -- "${file}"
+			;;
+		(*)
+			fatal_exit "${EX_INV_HASH}" "Unsupported hash algorithm: ${alg}"
+			;;
 	esac
 }
 
@@ -4284,6 +4342,7 @@ run_artifact_input_files() {
 			-mindepth 1 \
 			-maxdepth 1 \
 			-type f \
+			! -name '*.tmp.*' \
 			! -name 'MANIFEST.sha256' \
 			! -name 'MANIFEST.sha512' \
 			! -name 'MANIFEST.sha256.*' \
@@ -4318,7 +4377,8 @@ write_run_artifact_hash_manifest() {
 	local file
 
 	case "${alg}" in
-		('sha256' | 'sha512') ;;
+		('sha256' | 'sha512')
+			;;
 		(*)
 			return "${EX_USAGE}"
 			;;
@@ -4546,17 +4606,8 @@ inventory_sign_hash_manifests() {
         fi
 
 		case "${signer_command}" in
-			('sq')
-				sign_hash_manifest_with_sq "${manifest_file}"
-				;;
-			('gpg')
-				sign_hash_manifest_with_gpg "${manifest_file}"
-				;;
-			('ssh-keygen')
-				sign_hash_manifest_with_ssh_keygen "${manifest_file}"
-				;;
-			('minisign')
-				sign_hash_manifest_with_minisign "${manifest_file}"
+			('sq' | 'gpg' | 'ssh-keygen' | 'minisign')
+				"sign_hash_manifest_with_${signer_command/-/_}" "${manifest_file}"
 				;;
 			(*)
 				fatal_exit "${EX_CONFIG}" "Unsupported signer: ${signer_command} (supported: sq, gpg, ssh-keygen, minisign)"
@@ -4640,6 +4691,68 @@ copy_mark_destination_failed() {
 		"Could not record failed artifact '${artifact_path}': ${artifact_last_error}"
 }
 
+assert_no_symlinked_destination_parent() {
+    local path="${1}"
+    local parent
+    local current="${destination_dir}"
+    local component
+    local -a components=()
+
+    parent="$(dirname -- "${relative_path}")"
+
+    # A top-level path has no parent beneath destination_dir.
+    [[ "${parent}" == '.' ]] && return 0
+
+    IFS='/' read -r -a components <<< "${parent}"
+
+    for component in "${components[@]}"; do
+        [[ -n "${component}" ]] || continue
+        current="${current}/${component}"
+
+        if [[ -L "${current}" ]]; then
+            fatal_exit "${EX_COPY_PREP}" \
+                "Refusing to copy through destination symlink: ${current}"
+        fi
+    done
+}
+
+remove_existing_destination() {
+    local destination_path="${1}"
+    local expected_type="${2}"
+    local actual_type
+
+    if ! [[ -e "${destination_path}" || -L "${destination_path}" ]]; then
+		return 0
+	fi
+
+    if [[ "${FORCE}" != 'true' ]]; then
+        fatal_exit "${EX_FORCE_REQUIRED}" \
+            "Destination path already exists: ${destination_path}"
+    fi
+
+    actual_type="$(get_filesystem_object_type "${destination_path}")"
+
+    if [[ "${actual_type}" != "${expected_type}" ]]; then
+        fatal_exit "${EX_COPY_PREP}" \
+            "Refusing destination type conflict at ${destination_path}: expected ${expected_type}, found ${actual_type}"
+    fi
+
+    case "${actual_type}" in
+        ('file' | 'symlink')
+            rm -- "${destination_path}"
+            ;;
+        ('directory')
+            # Do not recursively remove a destination directory.
+            fatal_exit "${EX_COPY_PREP}" \
+                "Refusing to replace destination directory: ${destination_path}"
+            ;;
+        (*)
+            fatal_exit "${EX_COPY_PREP}" \
+                "Refusing to replace destination object: ${destination_path} (${actual_type})"
+            ;;
+    esac
+}
+
 # copy_prepare_source_lists() {
 
 # }
@@ -4663,17 +4776,7 @@ copy_regular_file() {
 	local destination_path="${destination_dir}/${relative_path}"
 	local device inode link_count identity first_destination
 
-	if [[ -e "${destination_path}" || -L "${destination_path}" ]]; then
-		if [[ "${FORCE}" != 'true' ]]; then
-			fatal_exit "${EX_FORCE_REQUIRED}" \
-				"Destination path already exists: ${destination_path}"
-		fi
-
-		if ! rm -rf -- "${destination_path}"; then
-			fatal_exit "${EX_COPY_FILES}" \
-				"Could not remove existing destination path: ${destination_path}"
-		fi
-	fi
+	remove_existing_destination "${destination_path}" 'file'
 
 	if read -r device inode link_count < <(
 		stat --format='%d %i %h' -- "${source_path}"
@@ -4685,6 +4788,8 @@ copy_regular_file() {
 	fi
 
 	identity="${device}:${inode}"
+
+	assert_no_symlinked_destination_parent "${relative_path}"
 	mkdir --parents -- "$(dirname -- "${destination_path}")"
 
 	if [[ "${hardlink_mode}" == 'reject' &&
@@ -4738,6 +4843,7 @@ copy_symbolic_link() {
 	local destination_path="${destination_dir}/${relative_path}"
 	local target
 
+	assert_no_symlinked_destination_parent "${relative_path}"
 	mkdir --parents -- "$(dirname -- "${destination_path}")"
 
 	if [[ "${symlink_mode}" == reject ]]; then
@@ -4745,13 +4851,7 @@ copy_symbolic_link() {
 			"Symbolic link encountered while symlink mode is reject: ${source_path}"
 	fi
 
-	if [[ -e "${destination_path}" || -L "${destination_path}" ]]; then
-		if [[ "${FORCE}" != true ]]; then
-			fatal_exit "${EX_FORCE_REQUIRED}" \
-				"Destination path already exists: ${destination_path}"
-		fi
-		rm -rf -- "${destination_path}"
-	fi
+	remove_existing_destination "${destination_path}" 'symlink'
 
 	case "${symlink_mode}" in
 		('preserve')
@@ -4765,7 +4865,6 @@ copy_symbolic_link() {
 					"Could not recreate symbolic link: ${destination_path}"
 			fi
 			;;
-
 		('dereference')
 			if [[ ! -e "${source_path}" ]]; then
 				fatal_exit "${EX_COPY_SYMLINKS}" \
@@ -4779,7 +4878,6 @@ copy_symbolic_link() {
 					"Could not dereference symbolic link: ${source_path}"
 			fi
 			;;
-
 		(*)
 			fatal_exit "${EX_CONFIG}" "Unsupported symlink mode: ${symlink_mode}"
 			;;
@@ -4791,13 +4889,38 @@ copy_symbolic_link() {
 # region 19.4. Directory copying                               #
 # ------------------------------------------------------------ #
 
-# copy_directory() {
+copy_create_directories() {
+    local inventory_dir="${1}"
+    local path relative_path destination_path
 
-# }
+    while IFS= read -r -d '' path; do
+        relative_path="${path#./}"
+        destination_path="${destination_dir}/${relative_path}"
 
-# copy_directory_metadata() {
+        assert_no_symlinked_destination_parent "${relative_path}"
+        if mkdir --parents -- "${destination_path}"; then
+			copy_mark_destination_created "${path}"
+		else
+			copy_mark_destination_failed "${path}"
+		fi
+    done < "${inventory_dir}/source.directories.null"
+}
 
-# }
+copy_restore_directory_metadata() {
+    local inventory_dir="${1}"
+    local path relative_path destination_path
+
+    mapfile -d '' -t dirs < "${inventory_dir}/source.directories.null"
+
+    for ((i=${#dirs[@]} - 1; i >= 0; i--)); do
+        path="${dirs[i]}"
+        relative_path="${path#./}"
+        destination_path="${destination_dir}/${relative_path}"
+
+        cp --archive --attributes-only --no-preserve=links \
+            -- "${source_dir}/${relative_path}" "${destination_path}"
+    done
+}
 
 # ------------------------------------------------------------ #
 # endregion                                                    #
@@ -4822,7 +4945,7 @@ rsync_add_supported_option() {
 	local capability_name="${2}"
 	local option="${3}"
 
-	if [[ "${rsync_capability["${capability_name}"]:-unknown}" == 'true' ]]; then
+	if [[ "${rsync_capabilities["${capability_name}"]:-unknown}" == 'true' ]]; then
 		command_ref+=("${option}")
 	fi
 }
@@ -4898,12 +5021,12 @@ copy_with_rsync() {
 # ------------------------------------------------------------ #
 
 copy_validate_special_object_policy() {
-	if [[ "${copy_special_objects}" != 'true' ]]; then
+	if [[ "${copy_special_objects_policy}" != 'true' ]]; then
 		return 0
 	fi
 
-	if [[ "${capability_rsync}" == 'true' &&
-		"${rsync_capability[hardlink_specials]:-false}" != 'true' ]]; then
+	if [[ "${capability[rsync]}" == 'true' &&
+		"${rsync_capabilities[hardlink_specials]:-false}" != 'true' ]]; then
 		log_warning 'rsync lacks hardlink-special support; special-object handling may be limited'
 	fi
 
@@ -4934,7 +5057,7 @@ copy_validate_inventory_object_types() {
 				;;
 
 			('fifo')
-				if [[ "${copy_special_objects}" != 'true' ]]; then
+				if [[ "${copy_special_objects_policy}" != 'true' ]]; then
 					fatal_exit "${EX_COPY_FILES}" \
 						"FIFO encountered but special-object copying is disabled: ${relative_path}"
 				fi
@@ -4945,7 +5068,7 @@ copy_validate_inventory_object_types() {
 					"Socket objects cannot be copied: ${relative_path}"
 				;;
 			('block-device' | 'character-device')
-				if [[ "${copy_special_objects}" != 'true' ]]; then
+				if [[ "${copy_special_objects_policy}" != 'true' ]]; then
 					fatal_exit "${EX_COPY_FILES}" \
 						"Device node encountered but special-object copying is disabled: ${relative_path}"
 				fi
@@ -4959,6 +5082,28 @@ copy_validate_inventory_object_types() {
 	done < "${inventory_dir}/source.all.null"
 }
 
+copy_validate_backend_object_types() {
+    local inventory_dir="${1}"
+    local path type
+
+    if [[ "${capability[rsync]}" == 'true' ]]; then
+		return 0
+	fi
+
+    while IFS= read -r -d '' path; do
+        type="$(get_filesystem_object_type "${source_dir}/${path#./}")"
+
+        case "${type}" in
+            ('file' | 'directory' | 'symlink')
+                ;;
+            (*)
+                fatal_exit "${EX_COPY_FILES}" \
+                    "Fallback copy backend does not support ${type}: ${path}"
+                ;;
+        esac
+    done < "${inventory_dir}/source.all.null"
+}
+
 # ------------------------------------------------------------ #
 # endregion                                                    #
 # region 19.8. Non-rsync backend                               #
@@ -4967,6 +5112,8 @@ copy_validate_inventory_object_types() {
 copy_without_rsync() {
 	local inventory_dir="${1}"
 	local path
+
+	copy_create_directories "${inventory_dir}"
 
 	while IFS= read -r -d '' path; do
 		if copy_regular_file "${path}"; then
@@ -4990,17 +5137,19 @@ copy_without_rsync() {
 		fi
 	done < "${inventory_dir}/source.symlinks.null"
 
-	while IFS= read -r -d '' path; do
-		if cp --archive --attributes-only --parents \
-			-- "${path}" "${destination_dir}"; then
-			copy_mark_destination_created "${path}"
-		else
-			local rc="${?}"
-			copy_mark_destination_failed "${path}" \
-				"Directory copy failed with exit ${rc}"
-			return "${rc}"
-		fi
-	done < "${inventory_dir}/source.directories.null"
+	copy_restore_directory_metadata "${inventory_dir}"
+
+	# while IFS= read -r -d '' path; do
+	# 	if cp --archive --attributes-only --parents \
+	# 		-- "${path}" "${destination_dir}"; then
+	# 		copy_mark_destination_created "${path}"
+	# 	else
+	# 		local rc="${?}"
+	# 		copy_mark_destination_failed "${path}" \
+	# 			"Directory copy failed with exit ${rc}"
+	# 		return "${rc}"
+	# 	fi
+	# done < "${inventory_dir}/source.directories.null"
 }
 
 # copy_regular_files() {
@@ -5030,7 +5179,7 @@ copy_transfer_objects() {
 	fi
 
 	# TO-DO: Confirm user wants to copy files
-	if [[ "${capability_rsync}" == 'true' ]]; then
+	if [[ "${capability[rsync]}" == 'true' ]]; then
 		copy_with_rsync "${inventory_dir}"
 	else
 		copy_without_rsync "${inventory_dir}"
@@ -5170,10 +5319,18 @@ inventory_validate_signature_artifacts() {
 	local unexpected_extension
 
 	case "${signer_command}" in
-		('sq' | 'ssh-keygen') expected_extension='sig' ;;
-		('gpg')              expected_extension='asc' ;;
-		('minisign')         expected_extension='minisig' ;;
-		(*) fatal_exit "${EX_CONFIG}" "Unsupported signer: ${signer_command}" ;;
+		('sq' | 'ssh-keygen')
+			expected_extension='sig'
+			;;
+		('gpg')
+			expected_extension='asc'
+			;;
+		('minisign')
+			expected_extension='minisig'
+			;;
+		(*)
+			fatal_exit "${EX_CONFIG}" "Unsupported signer: ${signer_command}"
+			;;
 	esac
 
 	for manifest in \
@@ -5248,8 +5405,8 @@ verify_hash_manifest_with_gpg() {
 
 	# TO-DO: Let user specify a signature to compare against
 	# https://superuser.com/a/1510996
-	if [[ -n "${gpg_expected_fingerprint}" ]]; then
-		fingerprint="$(printf '%s\n' "${gpg_expected_fingerprint}" | tr a-z A-Z | tr -dc A-Z0-9)"
+	if [[ -n "${gpg_verification_fingerprint}" ]]; then
+		fingerprint="$(printf '%s\n' "${gpg_verification_fingerprint}" | tr a-z A-Z | tr -dc A-Z0-9)"
 		status="$(gpg --status-fd=4 --trust-model=always --verify "${manifest_signed}" "${manifest_file}" 4>&1 > /dev/null 2>&1)"
 		if ! grep "^\\[GNUPG:\\] VALIDSIG ${fingerprint} " <<< "${status}"; then
 			fatal_exit "${EX_SIG_VERIFY_FAILED}" "GPG signature fingerprint did not match expected fingerprint: ${fingerprint}"
@@ -5325,10 +5482,18 @@ verify_inventory_signatures() {
 	local signature
 
 	case "${signer_command}" in
-		('sq' | 'ssh-keygen') extension='sig' ;;
-		('gpg')              extension='asc' ;;
-		('minisign')         extension='minisig' ;;
-		(*) fatal_exit "${EX_CONFIG}" "Unsupported signer: ${signer_command}" ;;
+		('sq' | 'ssh-keygen')
+			extension='sig'
+			;;
+		('gpg')
+			extension='asc'
+			;;
+		('minisign')
+			extension='minisig'
+			;;
+		(*)
+			fatal_exit "${EX_CONFIG}" "Unsupported signer: ${signer_command}"
+			;;
 	esac
 
 	for manifest in \
@@ -5347,13 +5512,7 @@ verify_inventory_signatures() {
 				"Signature is missing: ${signature}"
 		fi
 
-		case "${signer_command}" in
-			('sq')         verify_hash_manifest_with_sq "${signature}" ;;
-			('gpg')        verify_hash_manifest_with_gpg "${signature}" ;;
-			('ssh-keygen') verify_hash_manifest_with_ssh_keygen "${signature}" ;;
-			('minisign')   verify_hash_manifest_with_minisign "${signature}" ;;
-			(*) ;;
-		esac
+		"verify_hash_manifest_with_${signer_command/-/_}" "${signature}"
 	done
 }
 
@@ -5410,7 +5569,7 @@ verify_destination_against_inventory() {
 		"${FUNCNAME[0]}" \
 		'run' \
 		"${actual_manifest_path}" \
-		'write_source_object_manifest' \
+		'build_object_manifest' \
 		"${destination_dir}" \
 		"${run_dir}/${destination_list_path}"; then
 		:
@@ -5557,9 +5716,7 @@ write_run_statistics() {
 	local rc="${1}"
 	local elapsed_ns elapsed_sec
 	local manifest_file_sha256 manifest_file_sha512 signature_file_sha256 signature_file_sha512
-	local manifest_file_sha256_j manifest_file_sha512_j signature_file_sha256_j signature_file_sha512_j
-	local source_dir_j destination_dir_j output_dir_j run_dir_j signer_j script_name_j run_id_j timings_file_j log_file_j
-	local dry_run_j force_j sign_j inventory_done_j copy_done_j
+	local timings_file_j log_file_j
 
 	end_epoch_ns="$(date '+%s%9N')"
 	elapsed_ns="$((end_epoch_ns - start_epoch_ns))"
@@ -5592,58 +5749,47 @@ write_run_statistics() {
 		signature_file_sha512='MANIFEST.sha512.minisig'
 	fi
 
-	# Escape all JSON strings
-	run_id_j="$(json_string_or_null "${run_id}")"
-	script_name_j="$(json_string_or_null "${FSC_SCRIPT_NAME}")"
-	source_dir_j="$(json_string_or_null "${source_dir}")"
-	destination_dir_j="$(json_string_or_null "${destination_dir}")"
-	output_dir_j="$(json_string_or_null "${output_dir}")"
-	run_dir_j="$(json_string_or_null "${run_dir}")"
-	signer_j="$(json_string_or_null "${signer_command}")"
-	timings_file_j="$(json_string_or_null "$(basename "${final_timings_log:-${bootstrap_timings_log}}")")"
-	log_file_j="$(json_string_or_null "$(basename "${final_log}")")"
-	manifest_file_sha256_j="$(json_string_or_null "${manifest_file_sha256}")"
-	manifest_file_sha512_j="$(json_string_or_null "${manifest_file_sha512}")"
-	signature_file_sha256_j="$(json_string_or_null "${signature_file_sha256}")"
-	signature_file_sha512_j="$(json_string_or_null "${signature_file_sha512}")"
+	# Basename stuff
+	timings_file_j="$(basename "${final_timings_log:-${bootstrap_timings_log}}")"
+	log_file_j="$(basename "${final_log}")"
 
-	dry_run_j="$(json_bool "${dry_run}")"
-	force_j="$(json_bool "${FORCE}")"
-	sign_j="$(json_bool "${sign}")"
-	inventory_done_j="$(json_bool "${inventory_completed}")"
-	copy_done_j="$(json_bool "${copy_completed}")"
-
+	# shellcheck disable=SC2310,SC2312
 	cat > "${run_dir}/run.stats.json" << EOF
 {
-  "run_id": ${run_id_j},
-  "script_name": ${script_name_j},
-  "start_epoch_ns": ${start_epoch_ns:-null},
-  "end_epoch_ns": ${end_epoch_ns:-null},
-  "duration_ns": ${elapsed_ns:-null},
-  "duration_sec": ${elapsed_sec:-null},
-  "exit_code": ${rc:-null},
-  "source_dir": ${source_dir_j},
-  "destination_dir": ${destination_dir_j},
-  "output_dir": ${output_dir_j},
-  "run_dir": ${run_dir_j},
-  "dry_run": ${dry_run_j:-null},
-  "force": ${force_j:-null},
-  "sign": ${sign_j:-null},
-  "signer": ${signer_j},
-  "inventory_done": ${inventory_done_j:-null},
-  "copy_done": ${copy_done_j:-null},
-  "warning_count": ${warn_count:-null},
-  "error_count": ${error_count:-null},
-  "source_files_count": ${inventory_file_count:-null},
-  "source_directories_count": ${inventory_directory_count:-null},
-  "source_symlinks_count": ${inventory_symlink_count:-null},
-  "source_all_count": ${inventory_object_count:-null},
-  "manifest_file_sha256": ${manifest_file_sha256_j},
-  "signature_file_sha256": ${signature_file_sha256_j},
-  "manifest_file_sha512": ${manifest_file_sha512_j},
-  "signature_file_sha512": ${signature_file_sha512_j},
-  "timings_file": ${timings_file_j},
-  "log_file": ${log_file_j}
+  "run_id": $(json_string_or_null "${run_id}"),
+  "script_name": $(json_string_or_null "${FSC_SCRIPT_NAME}"),
+  "start_epoch_ns": $(json_number_or_null "${start_epoch_ns}"),
+  "end_epoch_ns": $(json_number_or_null "${end_epoch_ns}"),
+  "duration_ns": $(json_number_or_null "${elapsed_ns}"),
+  "duration_sec": $(json_number_or_null "${elapsed_sec}"),
+  "exit_code": $(json_number_or_null "${rc}"),
+  "exit_code_name": $(json_string_or_null "$(get_exit_code_name "${rc}")"),
+  "source_dir": $(json_string_or_null "${source_dir}"),
+  "destination_dir": $(json_string_or_null "${destination_dir}"),
+  "output_dir": $(json_string_or_null "${output_dir}"),
+  "run_dir": $(json_string_or_null "${run_dir}"),
+  "dry_run": $(json_bool "${dry_run}"),
+  "force": $(json_bool "${FORCE}"),
+  "sign": $(json_bool "${sign}"),
+  "signer": $(json_string_or_null "${signer_command}"),
+  "inventory_done": $(json_bool "${inventory_completed}"),
+  "copy_done": $(json_bool "${copy_completed}"),
+  "warning_count": $(json_number_or_null "${warn_count}"),
+  "error_count": $(json_number_or_null "${error_count}"),
+  "source_files_count": $(json_number_or_null "${inventory_file_count}"),
+  "source_directories_count": $(json_number_or_null "${inventory_directory_count}"),
+  "source_symlinks_count": $(json_number_or_null "${inventory_symlink_count}"),
+  "source_all_count": $(json_number_or_null "${inventory_object_count}"),
+  "manifest_file_sha256": $(json_string_or_null "${manifest_file_sha256}"),
+  "signature_file_sha256": $(json_string_or_null "${signature_file_sha256}"),
+  "manifest_file_sha512": $(json_string_or_null "${manifest_file_sha512}"),
+  "signature_file_sha512": $(json_string_or_null "${signature_file_sha512}"),
+  "timings_file": $(json_string_or_null "${timings_file_j}"),
+  "log_file": $(json_string_or_null "${log_file_j}"),
+  "bash_logger_path": $(json_string_or_null "${BASH_LOGGER_FILE}"),
+  "fatal_exit_code": $(json_number_or_null "${exit_status}"),
+  "exit_phase": $(json_string_or_null "${exit_phase}"),
+  "exit_reason": $(json_string_or_null "${exit_reason}")
 }
 EOF
 }
@@ -5678,7 +5824,7 @@ finalise_run() {
 	local elapsed_ns
 	local elapsed_sec
 
-	# Prevent finalization errors from replacing the original status.
+	# Prevent finalisation errors from replacing the original status.
 	set +e
 
 	if [[ -n "${active_phase}" ]]; then
@@ -5737,6 +5883,34 @@ install_traps() {
 #endregion                                                                     #
 #region  22. PHASE ORCHESTRATION                                               #
 #==============================================================================#
+
+run_preflight_checks() {
+	transition_phase 'preflight'
+
+	detect_rsync_information
+	parse_rsync_capabilities
+	
+	require_gnu_getopt
+
+	parse_command_line "${@}"
+	validate_configuration
+}
+
+run_setup() {
+	transition_phase 'run_setup'
+
+	create_run_directory
+
+	if ! initialise_artifact_registry; then
+		fatal_exit "${EX_INTERNAL}" "${artifact_last_error}"
+	fi
+	artifact_registry_initialised='true'
+
+	acquire_run_lock
+
+	finalise_log_location
+	finalise_timings_log_location
+}
 
 # ------------------------------------------------------------ #
 # region 22.1. Inventory phase                                 #
@@ -5823,11 +5997,10 @@ execute_copy_phase() {
 
 	transition_phase 'copy_transfer'
 	copy_transfer_objects
+	copy_completed='true'
 
 	transition_phase 'copy_post'
 	copy_collect_post_transfer_disk_usage
-
-	copy_completed='true'
 }
 
 # ------------------------------------------------------------ #
@@ -5908,32 +6081,19 @@ execute_verify_phase() {
 main() {
 	start_epoch_ns="$(date '+%s%9N')"
 
-	create_bootstrap_log
-	create_bootstrap_timings_log
+	create_bootstrap_logs
 	install_traps
 	start_phase_at 'bootstrap' "${start_epoch_ns}"
+
+	check_required_dependencies
+	detect_optional_capabilities
 
 	transition_phase 'logger_init'
 	initialise_bash_logger
 
-	transition_phase 'preflight'
-	check_required_dependencies
-	detect_optional_capabilities
-	detect_rsync_information
-	parse_rsync_capabilities
-	
-	require_gnu_getopt
+	run_preflight_checks "${@}"
 
-	parse_command_line "${@}"
-	validate_configuration
-
-	transition_phase 'run_setup'
-	create_run_directory
-	if ! initialise_artifact_registry; then fatal_exit "${EX_INTERNAL}" "${artifact_last_error}"; fi
-	artifact_registry_initialised='true'
-	acquire_run_lock
-	finalise_log_location
-	finalise_timings_log_location
+	run_setup
 
 	log_notice 'Script starting'
 
